@@ -3,11 +3,8 @@ package com.pure.bubble
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -16,13 +13,18 @@ import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import kotlinx.coroutines.tasks.await
+import kotlin.math.max
+import kotlin.math.min
 
-data class Item(val rect: Rect, val text: String, val bg: Int, val fg: Int)
+/** نص مكتشف (قبل الترجمة). */
+data class Block(val rect: Rect, val text: String, val bg: Int, val fg: Int, val lines: Int)
 
+/** عنصر جاهز للرسم (بعد الترجمة). */
+data class Item(val rect: Rect, val text: String, val bg: Int, val fg: Int, val lines: Int)
+
+/** قراءة النص من الصورة (OCR) + تقسيم ذكي للأسطر + لون الخلفية. الترجمة بملف Translators. */
 class Engine {
     private val recognizers = HashMap<String, TextRecognizer>()
-    private val translators = HashMap<String, Translator>()
-    private val ready = HashSet<String>()
 
     private fun recognizer(src: String): TextRecognizer = recognizers.getOrPut(src) {
         when (src) {
@@ -36,84 +38,106 @@ class Engine {
         }
     }
 
-    private fun translator(src: String, tgt: String): Translator =
-        translators.getOrPut("$src>$tgt") {
-            Translation.getClient(
-                TranslatorOptions.Builder()
-                    .setSourceLanguage(src)
-                    .setTargetLanguage(tgt)
-                    .build()
-            )
-        }
+    /**
+     * crop = منطقة الإطار العائم (إذا null نقرأ الشاشة كاملة).
+     * exclude = مستطيلات ما نقرأها (الفقاعة، القائمة…) بإحداثيات الشاشة.
+     */
+    suspend fun detect(frame: Bitmap, src: String, crop: Rect?, exclude: List<Rect>): List<Block> {
+        val ox = crop?.left ?: 0
+        val oy = crop?.top ?: 0
+        val bmp = if (crop != null) {
+            val l = crop.left.coerceIn(0, frame.width - 2)
+            val t = crop.top.coerceIn(0, frame.height - 2)
+            val w = min(crop.width(), frame.width - l).coerceAtLeast(2)
+            val h = min(crop.height(), frame.height - t).coerceAtLeast(2)
+            Bitmap.createBitmap(frame, l, t, w, h)
+        } else frame
 
-    /** يحمّل نموذج الترجمة أول مرة فقط (يحتاج انترنت). */
-    suspend fun ensureModel(src: String, tgt: String) {
-        val key = "$src>$tgt"
-        if (ready.contains(key)) return
-        translator(src, tgt).downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
-        ready.add(key)
-    }
-
-    fun isModelReady(src: String, tgt: String) = ready.contains("$src>$tgt")
-
-    suspend fun run(frame: Bitmap, src: String, tgt: String, exclude: Rect?): List<Item> {
-        if (src == tgt) return emptyList()
-
-        val result = recognizer(src).process(InputImage.fromBitmap(frame, 0)).await()
-        val blocks = result.textBlocks.filter { b ->
-            val r = b.boundingBox
-            r != null &&
-                    b.text.trim().length >= 2 &&
-                    b.text.any { it.isLetter() } &&
-                    (exclude == null || !Rect.intersects(r, exclude))
-        }
-        if (blocks.isEmpty()) return emptyList()
-
-        ensureModel(src, tgt)
-        val tr = translator(src, tgt)
+        val result = recognizer(src).process(InputImage.fromBitmap(bmp, 0)).await()
         val joiner = if (Langs.cjk.contains(src)) "" else " "
-
-        val out = ArrayList<Item>()
-        for (b in blocks) {
-            val rect = b.boundingBox ?: continue
-            val clean = b.text.lines().map { it.trim() }.filter { it.isNotEmpty() }
-                .joinToString(joiner).trim()
-            if (clean.isEmpty()) continue
-            val translated = try {
-                tr.translate(clean).await().trim()
-            } catch (e: Exception) {
-                continue
+        val out = ArrayList<Block>()
+        for (b in result.textBlocks) {
+            for (g in groupLines(b.lines, joiner)) {
+                val text = g.second.trim()
+                if (text.length < 2 || text.none { it.isLetter() }) continue
+                val local = g.first
+                val screenRect = Rect(local.left + ox, local.top + oy, local.right + ox, local.bottom + oy)
+                if (exclude.any { Rect.intersects(it, screenRect) }) continue
+                val bg = sampleBg(bmp, local)
+                val fg = if (luminance(bg) > 0.55f) Color.BLACK else Color.WHITE
+                out.add(Block(screenRect, text, bg, fg, g.third))
             }
-            if (translated.isEmpty() || translated.equals(clean, ignoreCase = true)) continue
-
-            val bg = sampleBg(frame, rect)
-            out.add(Item(Rect(rect), translated, bg, if (luminance(bg) > 0.55f) Color.BLACK else Color.WHITE))
         }
         return out
     }
 
-    /** لون الخلفية المحيطة بالنص (الوسيط من نقاط حول الصندوق). */
+    /** يقسم أسطر البلوك لمجموعات: فراغ عمودي كبير أو اختلاف حجم الخط = نص منفصل. */
+    private fun groupLines(lines: List<Text.Line>, joiner: String): List<Triple<Rect, String, Int>> {
+        val ls = lines.filter { it.boundingBox != null && it.text.isNotBlank() }
+            .sortedBy { it.boundingBox!!.top }
+        val res = ArrayList<Triple<Rect, String, Int>>()
+        var cur: Rect? = null
+        var sb = StringBuilder()
+        var n = 0
+        var lastH = 1
+        var lastBottom = 0
+        for (l in ls) {
+            val r = l.boundingBox!!
+            val h = max(1, r.height())
+            val c = cur
+            val split = c != null && (
+                    r.top - lastBottom > 0.9f * max(h, lastH) ||
+                            max(h, lastH) > 1.8f * min(h, lastH) ||
+                            r.left > c.right + 2 * h || r.right < c.left - 2 * h
+                    )
+            if (split && c != null) {
+                res.add(Triple(c, sb.toString(), n))
+                cur = null
+                sb = StringBuilder()
+                n = 0
+            }
+            if (cur == null) cur = Rect(r) else cur.union(r)
+            if (sb.isNotEmpty()) sb.append(joiner)
+            sb.append(l.text.trim())
+            n++
+            lastH = h
+            lastBottom = r.bottom
+        }
+        val c = cur
+        if (c != null) res.add(Triple(c, sb.toString(), n))
+        return res
+    }
+
+    /** لون الخلفية = اللون الأكثر تكراراً على حلقة حول النص. */
     private fun sampleBg(bmp: Bitmap, r: Rect): Int {
         val pad = 4
-        val l = (r.left - pad).coerceIn(0, bmp.width - 1)
-        val t = (r.top - pad).coerceIn(0, bmp.height - 1)
-        val rr = (r.right + pad).coerceIn(0, bmp.width - 1)
-        val bb = (r.bottom + pad).coerceIn(0, bmp.height - 1)
-        val xs = intArrayOf(l, (l + rr) / 2, rr)
-        val ys = intArrayOf(t, (t + bb) / 2, bb)
-        val reds = ArrayList<Int>()
-        val greens = ArrayList<Int>()
-        val blues = ArrayList<Int>()
-        for (xi in xs.indices) {
-            for (yi in ys.indices) {
-                if (xi == 1 && yi == 1) continue
-                val p = bmp.getPixel(xs[xi], ys[yi])
-                reds.add(Color.red(p)); greens.add(Color.green(p)); blues.add(Color.blue(p))
-            }
+        val l = max(0, r.left - pad)
+        val t = max(0, r.top - pad)
+        val rr = min(bmp.width - 1, r.right + pad)
+        val bb = min(bmp.height - 1, r.bottom + pad)
+        if (rr <= l || bb <= t) return Color.WHITE
+        val counts = HashMap<Int, Int>()
+        fun add(x: Int, y: Int) {
+            val p = bmp.getPixel(x, y)
+            val k = ((Color.red(p) shr 3) shl 10) or ((Color.green(p) shr 3) shl 5) or (Color.blue(p) shr 3)
+            counts[k] = (counts[k] ?: 0) + 1
         }
-        reds.sort(); greens.sort(); blues.sort()
-        val m = reds.size / 2
-        return Color.rgb(reds[m], greens[m], blues[m])
+        val steps = 14
+        for (i in 0..steps) {
+            val x = l + (rr - l) * i / steps
+            add(x, t)
+            add(x, bb)
+            val y = t + (bb - t) * i / steps
+            add(l, y)
+            add(rr, y)
+        }
+        var best = 0
+        var bestN = -1
+        for ((k, v) in counts) if (v > bestN) { best = k; bestN = v }
+        val r5 = (best shr 10) and 31
+        val g5 = (best shr 5) and 31
+        val b5 = best and 31
+        return Color.rgb((r5 shl 3) or 4, (g5 shl 3) or 4, (b5 shl 3) or 4)
     }
 
     private fun luminance(c: Int): Float =
@@ -121,7 +145,6 @@ class Engine {
 
     fun close() {
         recognizers.values.forEach { runCatching { it.close() } }
-        translators.values.forEach { runCatching { it.close() } }
-        recognizers.clear(); translators.clear(); ready.clear()
+        recognizers.clear()
     }
 }
