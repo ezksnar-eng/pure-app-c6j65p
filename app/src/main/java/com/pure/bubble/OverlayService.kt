@@ -8,55 +8,38 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.Canvas
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
 
-/**
- * فكرة الشغل (بدون وميض وبدون ما الترجمة "تلاحقك"):
- *  1) كل ~110ms ناخذ بصمة خفيفة من الشاشة ونقارنها بالسابقة (نتجاهل مناطق صناديقنا).
- *  2) إذا الصفحة انزاحت (تمرير) ننزّل الصناديق نفس المسافة فوراً — تبقى ملزوقة بالنص.
- *  3) إذا تغير المحتوى كلياً نمسح الصناديق فوراً.
- *  4) لما الشاشة تثبت: نرجّع لون/شكل الأصل تحت صناديقنا من آخر صورة نظيفة (بدون إخفاء الطبقة)،
- *     نقرأ النص، نترجم، ونبدّل كل الصناديق دفعة وحدة.
- *  5) فقط إذا الشاشة بلا ملامح نقدر نتتبع عليها (صفحة نص أبيض مثلاً) نخفي الطبقة لحظة للتأكد.
- */
 class OverlayService : Service() {
 
     companion object {
@@ -65,7 +48,6 @@ class OverlayService : Service() {
         const val EXTRA_DATA = "data"
         private const val CHANNEL_ID = "pure_bubble_channel"
         private const val NOTIF_ID = 77
-        private const val PINK = 0xFFD94F84.toInt()
 
         @Volatile
         var running = false
@@ -77,47 +59,34 @@ class OverlayService : Service() {
 
     private var projection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
-    private var reader: ImageReader? = null
-    private var vd: VirtualDisplay? = null
+    private var source: CaptureSource? = null
     private var screenW = 0
     private var screenH = 0
-    private var dpi = 0
-    private var frameCounter = 0
-    private var held: Image? = null
 
-    private var layer: TranslationLayer? = null
-    private var layerLp: WindowManager.LayoutParams? = null
     private var bubble: ImageView? = null
     private var bubbleLp: WindowManager.LayoutParams? = null
-    private var handle: View? = null
-    private var handleLp: WindowManager.LayoutParams? = null
-    private var menu: LinearLayout? = null
-    private var menuLp: WindowManager.LayoutParams? = null
+    private var bubbleSize = 0
+    private var layer: TranslationLayer? = null
+    private var layerLp: WindowManager.LayoutParams? = null
+    private var scrim: FrameLayout? = null
+    private var regionView: RegionView? = null
 
-    private val frame = Rect()          // الإطار العائم (إحداثيات الشاشة)
-
-    private var loopJob: Job? = null
-    private var paused = false
+    private var pipeline: Pipeline? = null
+    private var translators: Translators? = null
+    private var ocr: Ocr? = null
     private var busy = false
-    private var epoch = 0
-    private var dirty = true
-    private var dirtySince = 0L
-    private var stableSince = 0L
-    private var lastPeek = 0L
-    private var prevSig: Sig? = null
-    private var cleanSig: Sig? = null
-    private val boxHistory = ArrayDeque<List<Rect>>()
-    private var totalShift = 0
-    private var clean: Bitmap? = null
-    private var cleanShift = 0
 
-    private lateinit var engine: Engine
-    private lateinit var hub: Hub
     private lateinit var settings: AppSettings
 
-    private val hideMenuRunnable = Runnable { hideMenu() }
-
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun overlayType() =
+        if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+    // ================================================================= start
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -142,16 +111,43 @@ class OverlayService : Service() {
 
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         settings = Prefs.load(this)
-        engine = Engine()
-        hub = Hub(settings)
-        hub.onError = { m -> toast(m) }
 
         try {
-            setupCapture(code, data)
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val p = mpm.getMediaProjection(code, data)
+            val cb = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    main.post { stopSelf() }
+                }
+            }
+            p.registerCallback(cb, main)
+            projection = p
+            projectionCallback = cb
+
+            val dm = realMetrics()
+            screenW = dm.widthPixels
+            screenH = dm.heightPixels
+            val src = CaptureSource(p, screenW, screenH, dm.densityDpi, main)
+            source = src
+
+            val tr = Translators()
+            val oc = Ocr()
+            translators = tr
+            ocr = oc
+
             addLayer()
-            initFrame()
             addBubble()
-            applyModeViews()
+
+            val pl = Pipeline(
+                scope, src, layer!!, tr, oc,
+                settingsProvider = { settings },
+                excludeRects = { bubbleRects() },
+                toast = { msg -> toast(msg) },
+                onBusy = { b -> busy = b; styleBubble() }
+            )
+            pipeline = pl
+            pl.start()
+            applyMode(settings.mode, fromMenu = false)
         } catch (e: Exception) {
             toast("تعذر بدء الترجمة: ${e.message}")
             stopSelf()
@@ -159,14 +155,8 @@ class OverlayService : Service() {
         }
 
         running = true
-        startLoop()
-        toast(if (settings.mode == 1) "حرّك الإطار فوق النص اللي تريد تترجمه" else "الترجمة التلقائية شغالة")
         return START_NOT_STICKY
     }
-
-    // ================================================================= capture
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun realMetrics(): DisplayMetrics {
         val dm = DisplayMetrics()
@@ -175,173 +165,18 @@ class OverlayService : Service() {
         return dm
     }
 
-    private fun newReader(): ImageReader {
-        val r = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 3)
-        r.setOnImageAvailableListener({ frameCounter++ }, main)
-        return r
-    }
-
-    private fun setupCapture(code: Int, data: Intent) {
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val p = mpm.getMediaProjection(code, data)
-        val cb = object : MediaProjection.Callback() {
-            override fun onStop() {
-                main.post { stopSelf() }
-            }
-        }
-        p.registerCallback(cb, main)
-        projection = p
-        projectionCallback = cb
-
-        val dm = realMetrics()
-        screenW = dm.widthPixels
-        screenH = dm.heightPixels
-        dpi = dm.densityDpi
-        val r = newReader()
-        reader = r
-        vd = p.createVirtualDisplay(
-            "pure-capture", screenW, screenH, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            r.surface, null, null
-        )
-    }
-
-    /** لو دارت الشاشة نعيد ضبط الالتقاط. */
-    private fun ensureSize() {
-        val dm = realMetrics()
-        if (dm.widthPixels == screenW && dm.heightPixels == screenH) return
-        screenW = dm.widthPixels
-        screenH = dm.heightPixels
-        dpi = dm.densityDpi
-        runCatching { held?.close() }
-        held = null
-        reader?.close()
-        val r = newReader()
-        reader = r
-        vd?.resize(screenW, screenH, dpi)
-        vd?.surface = r.surface
-        layerLp?.let {
-            it.width = screenW
-            it.height = screenH
-            layer?.let { v -> runCatching { wm.updateViewLayout(v, it) } }
-        }
-        clampFrame()
-        applyModeViews()
-    }
-
-    /** يسحب آخر صورة جديدة (إذا فيه). نحتفظ بآخر صورة مفتوحة حتى نقدر نترجم حتى لو الشاشة ثابتة. */
-    private fun pullFrame(): Boolean {
-        val r = reader ?: return false
-        val n: Image? = try {
-            r.acquireLatestImage()
-        } catch (e: Exception) {
-            null
-        }
-        if (n == null) return false
-        runCatching { held?.close() }
-        held = n
-        return true
-    }
-
-    private fun imageToBitmap(img: Image): Bitmap {
-        val plane = img.planes[0]
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * img.width
-        val bmp = Bitmap.createBitmap(
-            img.width + rowPadding / pixelStride, img.height, Bitmap.Config.ARGB_8888
-        )
-        plane.buffer.rewind()
-        bmp.copyPixelsFromBuffer(plane.buffer)
-        return bmp   // قابل للتعديل (نستعمله لإرجاع الأصل تحت الصناديق)
-    }
-
-    // ================================================================= area / frame
-
-    private fun areaRect(): Rect {
-        if (settings.mode != 1) return Rect(0, 0, screenW, screenH)
-        val i = dp(3)
-        return Rect(
-            frame.left + i, frame.top + i,
-            max(frame.left + i + 8, frame.right - i), max(frame.top + i + 8, frame.bottom - i)
-        )
-    }
-
-    private fun initFrame() {
-        if (settings.fr > settings.fl && settings.fb > settings.ft && settings.fl >= 0) {
-            frame.set(settings.fl, settings.ft, settings.fr, settings.fb)
-        } else {
-            val w = min((screenW * 0.62f).toInt(), dp(240))
-            val h = dp(72)
-            val l = (screenW - w) / 2
-            val t = (screenH * 0.68f).toInt()
-            frame.set(l, t, l + w, t + h)
-        }
-        clampFrame()
-    }
-
-    private fun clampFrame() {
-        val minW = dp(44)
-        val minH = dp(32)
-        val w = max(minW, min(frame.width(), screenW))
-        val h = max(minH, min(frame.height(), screenH))
-        val l = frame.left.coerceIn(0, max(0, screenW - w))
-        val t = frame.top.coerceIn(0, max(0, screenH - h))
-        frame.set(l, t, l + w, t + h)
-    }
-
-    private fun saveFrame() {
-        settings = settings.copy(fl = frame.left, ft = frame.top, fr = frame.right, fb = frame.bottom)
-        Prefs.save(this, settings)
-    }
-
-    private fun bubbleSize() = dp(settings.bubbleDp)
-
-    private fun placeFrameViews() {
-        val l = layer ?: return
-        l.setFrame(Rect(frame))
-        val b = bubble
-        val blp = bubbleLp
-        if (b != null && blp != null) {
-            val s = bubbleSize()
-            blp.x = (frame.left - s / 2).coerceIn(0, max(0, screenW - s))
-            blp.y = (frame.top - s / 2).coerceIn(0, max(0, screenH - s))
-            runCatching { wm.updateViewLayout(b, blp) }
-        }
-        val h = handle
-        val hlp = handleLp
-        if (h != null && hlp != null) {
-            val s = dp(26)
-            hlp.x = (frame.right - s / 2).coerceIn(0, max(0, screenW - s))
-            hlp.y = (frame.bottom - s / 2).coerceIn(0, max(0, screenH - s))
-            runCatching { wm.updateViewLayout(h, hlp) }
-        }
-    }
-
-    /** يطبّق وضع الشاشة الكاملة أو الإطار العائم على النوافذ. */
-    private fun applyModeViews() {
-        val l = layer ?: return
-        if (settings.mode == 1) {
-            clampFrame()
-            addHandle()
-            placeFrameViews()
-        } else {
-            l.setFrame(null)
-            removeHandle()
-        }
-        dropAll()
-        prevSig = null
-        markDirty(SystemClock.uptimeMillis())
+    private fun bubbleRects(): List<Rect> {
+        val lp = bubbleLp ?: return emptyList()
+        return listOf(Rect(lp.x, lp.y, lp.x + bubbleSize, lp.y + bubbleSize))
     }
 
     // ================================================================= views
 
     private fun addLayer() {
         val v = TranslationLayer(this)
-        v.accent = PINK
+        v.coverAlpha = (settings.coverAlpha * 255 / 100).coerceIn(150, 255)
         val lp = WindowManager.LayoutParams(
-            screenW, screenH,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            screenW, screenH, overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -361,29 +196,47 @@ class OverlayService : Service() {
         layerLp = lp
     }
 
-    private fun touchableParams(size: Int, x: Int, y: Int) = WindowManager.LayoutParams(
-        size, size,
-        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-        PixelFormat.TRANSLUCENT
-    ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        this.x = x
-        this.y = y
+    private fun toast(msg: String) {
+        main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() }
+    }
+
+    private fun styleBubble() {
+        val b = bubble ?: return
+        val pl = pipeline
+        val color = when {
+            pl != null && pl.paused -> 0xFF9AA0A6.toInt()
+            busy -> 0xFF2D8CFF.toInt()
+            else -> 0xFF2ECC71.toInt()
+        }
+        b.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.WHITE)
+            setStroke(dp(2), color)
+        }
     }
 
     private fun addBubble() {
-        val size = bubbleSize()
+        bubbleSize = dp(34)
         val b = ImageView(this).apply {
-            setImageResource(R.drawable.bubble_icon)
+            setImageResource(R.drawable.bubble_avatar)
             scaleType = ImageView.ScaleType.CENTER_CROP
+            setPadding(dp(2), dp(2), dp(2), dp(2))
             alpha = settings.bubbleAlpha / 100f
-            elevation = dp(3).toFloat()
         }
         bubble = b
-        val lp = touchableParams(size, screenW - size - dp(10), screenH / 3)
+        styleBubble()
+
+        val lp = WindowManager.LayoutParams(
+            bubbleSize, bubbleSize, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = screenW - bubbleSize - dp(6)
+            y = screenH / 3
+        }
         bubbleLp = lp
 
         b.setOnTouchListener(object : View.OnTouchListener {
@@ -392,7 +245,14 @@ class OverlayService : Service() {
             var touchX = 0f
             var touchY = 0f
             var moved = false
-            val startFrame = Rect()
+            var longFired = false
+            val longRunnable = Runnable {
+                if (!moved) {
+                    longFired = true
+                    b.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    openMenu()
+                }
+            }
 
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
@@ -402,410 +262,357 @@ class OverlayService : Service() {
                         touchX = e.rawX
                         touchY = e.rawY
                         moved = false
-                        startFrame.set(frame)
+                        longFired = false
+                        main.postDelayed(longRunnable, 450)
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dx = e.rawX - touchX
                         val dy = e.rawY - touchY
-                        if (!moved && hypot(dx, dy) > dp(6)) {
+                        if (!moved && hypot(dx, dy) > dp(8)) {
                             moved = true
-                            hideMenu()
-                            if (settings.mode == 1) dropAll()
+                            main.removeCallbacks(longRunnable)
                         }
                         if (moved) {
-                            if (settings.mode == 1) {
-                                val w = startFrame.width()
-                                val h = startFrame.height()
-                                val nl = (startFrame.left + dx).toInt().coerceIn(0, max(0, screenW - w))
-                                val nt = (startFrame.top + dy).toInt().coerceIn(0, max(0, screenH - h))
-                                frame.set(nl, nt, nl + w, nt + h)
-                                placeFrameViews()
-                            } else {
-                                lp.x = (startX + dx).toInt().coerceIn(0, max(0, screenW - lp.width))
-                                lp.y = (startY + dy).toInt().coerceIn(0, max(0, screenH - lp.height))
-                                runCatching { wm.updateViewLayout(b, lp) }
-                            }
+                            lp.x = (startX + dx).toInt().coerceIn(0, screenW - lp.width)
+                            lp.y = (startY + dy).toInt().coerceIn(0, screenH - lp.height)
+                            runCatching { wm.updateViewLayout(b, lp) }
                         }
                     }
                     MotionEvent.ACTION_UP -> {
-                        if (!moved) {
-                            toggleMenu()
-                        } else if (settings.mode == 1) {
-                            saveFrame()
-                            frameChanged()
-                        }
+                        main.removeCallbacks(longRunnable)
+                        if (!moved && !longFired) onBubbleTap()
                     }
+                    MotionEvent.ACTION_CANCEL -> main.removeCallbacks(longRunnable)
                 }
                 return true
             }
         })
+
         wm.addView(b, lp)
     }
 
-    private fun addHandle() {
-        if (handle != null) return
-        val s = dp(26)
-        val v = View(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xCCFFFFFF.toInt())
-                setStroke(dp(2), PINK)
+    // ================================================================= أطوار الترجمة
+
+    private fun onBubbleTap() {
+        val pl = pipeline ?: return
+        when (settings.mode) {
+            Mode.FULL -> {
+                if (pl.hasBoxes()) pl.clearBoxes() else pl.requestFull()
+            }
+            Mode.PARTIAL -> {
+                if (pl.region == null) startRegionSelect() else togglePause()
+            }
+            else -> togglePause()
+        }
+    }
+
+    private fun togglePause() {
+        val pl = pipeline ?: return
+        pl.setPaused(!pl.paused)
+        styleBubble()
+        toast(if (pl.paused) "الترجمة متوقفة مؤقتاً" else "رجعت الترجمة")
+    }
+
+    private fun applyMode(mode: Mode, fromMenu: Boolean) {
+        val pl = pipeline ?: return
+        settings = settings.copy(mode = mode)
+        Prefs.save(this, settings)
+        pl.setPaused(false)
+        pl.clearBoxes()
+        pl.setRegion(null)
+        pl.resetBaseline()
+        when (mode) {
+            Mode.FULL -> toast("اضغط الفقاعة لترجمة الشاشة")
+            Mode.PARTIAL -> {
+                if (fromMenu) main.postDelayed({ startRegionSelect() }, 350)
+                else toast("اضغط الفقاعة وحدد المنطقة")
+            }
+            Mode.AUTO -> {
+                pl.markAllDirty()
+                toast("الترجمة التلقائية")
+            }
+            Mode.REALTIME -> {
+                pl.markAllDirty()
+                toast("الترجمة في الوقت الحقيقي")
+            }
+            Mode.MANGA -> {
+                pl.markAllDirty()
+                toast("طور المانجا والمانهوا")
+            }
+            Mode.NOVEL -> {
+                pl.markAllDirty()
+                toast("طور الروايات والنصوص")
             }
         }
-        val lp = touchableParams(s, frame.right - s / 2, frame.bottom - s / 2)
-        handle = v
-        handleLp = lp
-        v.setOnTouchListener(object : View.OnTouchListener {
-            var startR = 0
-            var startB = 0
-            var tx = 0f
-            var ty = 0f
-            var moved = false
-            override fun onTouch(view: View, e: MotionEvent): Boolean {
-                when (e.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startR = frame.right
-                        startB = frame.bottom
-                        tx = e.rawX
-                        ty = e.rawY
-                        moved = false
-                        hideMenu()
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        if (!moved) {
-                            moved = true
-                            dropAll()
-                        }
-                        frame.right = (startR + (e.rawX - tx)).toInt().coerceIn(frame.left + dp(44), screenW)
-                        frame.bottom = (startB + (e.rawY - ty)).toInt().coerceIn(frame.top + dp(32), screenH)
-                        placeFrameViews()
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        if (moved) {
-                            saveFrame()
-                            frameChanged()
-                        }
-                    }
+        styleBubble()
+    }
+
+    private fun applyLanguages(src: String, tgt: String) {
+        val pl = pipeline ?: return
+        settings = settings.copy(src = src, tgt = tgt)
+        Prefs.save(this, settings)
+        pl.clearBoxes()
+        pl.resetBaseline()
+        if (settings.mode == Mode.PARTIAL) pl.region?.let { pl.setRegion(it) }
+        else if (settings.mode.continuous) pl.markAllDirty()
+    }
+
+    private fun startRegionSelect() {
+        val pl = pipeline ?: return
+        if (regionView != null) return
+        pl.setSuspended(true)
+        val rv = RegionView(this) { rect ->
+            regionView?.let { v -> runCatching { wm.removeView(v) } }
+            regionView = null
+            main.postDelayed({
+                pl.setSuspended(false)
+                if (rect != null) {
+                    pl.setRegion(rect)
+                    toast("تم تحديد المنطقة")
+                } else {
+                    toast("ما انحددت منطقة")
                 }
-                return true
-            }
-        })
-        wm.addView(v, lp)
-    }
-
-    private fun removeHandle() {
-        handle?.let { runCatching { wm.removeView(it) } }
-        handle = null
-        handleLp = null
-    }
-
-    private fun frameChanged() {
-        prevSig = null
-        markDirty(SystemClock.uptimeMillis())
-    }
-
-    // ---- القائمة الصغيرة (تظهر عند الضغط على الفقاعة)
-
-    private fun toggleMenu() {
-        if (menu != null) hideMenu() else showMenu()
-    }
-
-    private fun menuButton(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
-        text = label
-        textSize = 17f
-        gravity = Gravity.CENTER
-        setTextColor(PINK)
-        layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
-        setOnClickListener {
-            onClick()
-            main.removeCallbacks(hideMenuRunnable)
-            main.postDelayed(hideMenuRunnable, 4000)
+            }, 300)
         }
-    }
-
-    private fun showMenu() {
-        val b = bubble ?: return
-        val blp = bubbleLp ?: return
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            background = GradientDrawable().apply {
-                cornerRadius = dp(22).toFloat()
-                setColor(Color.WHITE)
-                setStroke(dp(2), PINK)
-            }
-            setPadding(dp(4), dp(2), dp(4), dp(2))
-            elevation = dp(6).toFloat()
-        }
-        row.addView(menuButton(if (paused) "▶" else "⏸") {
-            paused = !paused
-            if (paused) {
-                dropAll()
-            } else {
-                prevSig = null
-                markDirty(SystemClock.uptimeMillis())
-            }
-            hideMenu()
-        })
-        row.addView(menuButton(if (settings.mode == 1) "⛶" else "▭") {
-            settings = settings.copy(mode = 1 - settings.mode)
-            Prefs.save(this, settings)
-            hideMenu()
-            applyModeViews()
-            toast(if (settings.mode == 1) "وضع الإطار العائم" else "وضع الشاشة كاملة")
-        })
-        row.addView(menuButton("⚙") {
-            hideMenu()
-            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        })
-        row.addView(menuButton("✕") { stopSelf() })
-
-        val menuW = dp(40) * 4 + dp(8)
-        val s = bubbleSize()
-        val onRight = blp.x + s + dp(6) + menuW <= screenW
         val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            screenW, screenH, overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = if (onRight) blp.x + s + dp(6) else max(0, blp.x - menuW - dp(6))
-            y = (blp.y + s / 2 - dp(22)).coerceIn(0, max(0, screenH - dp(48)))
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
-        menu = row
-        menuLp = lp
-        wm.addView(row, lp)
-        main.removeCallbacks(hideMenuRunnable)
-        main.postDelayed(hideMenuRunnable, 4000)
+        wm.addView(rv, lp)
+        regionView = rv
     }
 
-    private fun hideMenu() {
-        main.removeCallbacks(hideMenuRunnable)
-        menu?.let { runCatching { wm.removeView(it) } }
-        menu = null
-        menuLp = null
-    }
+    // ================================================================= القائمة (ضغطة مطولة)
 
-    private fun excludeRects(): List<Rect> {
-        val out = ArrayList<Rect>()
-        val pad = dp(4)
-        bubbleLp?.let { out.add(Rect(it.x - pad, it.y - pad, it.x + it.width + pad, it.y + it.height + pad)) }
-        handleLp?.let { out.add(Rect(it.x - pad, it.y - pad, it.x + it.width + pad, it.y + it.height + pad)) }
-        val m = menu
-        val mlp = menuLp
-        if (m != null && mlp != null) {
-            val w = if (m.width > 0) m.width else dp(168)
-            val h = if (m.height > 0) m.height else dp(44)
-            out.add(Rect(mlp.x - pad, mlp.y - pad, mlp.x + w + pad, mlp.y + h + pad))
+    private fun pill(text: String, icon: String?, selected: Boolean, onClick: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), 0, dp(14), 0)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(26).toFloat()
+                setColor(if (selected) 0xFF00A650.toInt() else 0xFFF4F5F9.toInt())
+            }
+            setOnClickListener { onClick() }
         }
-        return out
+        if (icon != null) {
+            row.addView(TextView(this).apply {
+                this.text = icon
+                textSize = 20f
+                gravity = Gravity.CENTER
+                setTextColor(if (selected) Color.WHITE else 0xFF1B1B1F.toInt())
+            }, LinearLayout.LayoutParams(dp(30), ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        row.addView(TextView(this).apply {
+            this.text = text
+            textSize = 14.5f
+            gravity = Gravity.CENTER_VERTICAL or (if (icon == null) Gravity.CENTER_HORIZONTAL else Gravity.START)
+            setTextColor(if (selected) Color.WHITE else 0xFF1B1B1F.toInt())
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(8) })
+        return row
     }
 
-    // ================================================================= main loop
+    private fun LinearLayout.addPill(v: View, h: Int = 50) {
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(h))
+        lp.topMargin = dp(8)
+        addView(v, lp)
+    }
 
-    private fun startLoop() {
-        loopJob?.cancel()
-        loopJob = scope.launch {
-            while (isActive) {
-                delay(110)
-                if (paused) continue
-                try {
-                    tick()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // تجاهل أخطاء لحظية؛ الحلقة تكمل
+    private fun roundButton(icon: String, onClick: () -> Unit): View =
+        TextView(this).apply {
+            text = icon
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setTextColor(0xFF1B1B1F.toInt())
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0xFFF4F5F9.toInt())
+            }
+            setOnClickListener { onClick() }
+        }
+
+    private fun fillMenu(card: LinearLayout, page: Int, pickedSrc: String? = null) {
+        card.removeAllViews()
+        when (page) {
+            0 -> {
+                card.addPill(pill("ترجمة الشاشة الكاملة", "🖥", settings.mode == Mode.FULL) { chooseMode(Mode.FULL) }, 54)
+                card.addPill(pill("ترجمة جزئية", "✂", settings.mode == Mode.PARTIAL) { chooseMode(Mode.PARTIAL) })
+                card.addPill(pill("ترجمة تلقائية", "🔄", settings.mode == Mode.AUTO) { chooseMode(Mode.AUTO) })
+                card.addPill(pill("ترجمة في الوقت الحقيقي", "⚡", settings.mode == Mode.REALTIME) { chooseMode(Mode.REALTIME) }, 54)
+                card.addPill(pill("طور المانجا والمانهوا", "📖", settings.mode == Mode.MANGA) { chooseMode(Mode.MANGA) })
+                card.addPill(pill("طور الروايات والنصوص", "📚", settings.mode == Mode.NOVEL) { chooseMode(Mode.NOVEL) })
+
+                card.addView(View(this).apply { setBackgroundColor(0xFFE3E5EA.toInt()) },
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                        topMargin = dp(12); bottomMargin = dp(4)
+                    })
+
+                val pair = settings.tgt.uppercase() + "  ←  " + settings.src.uppercase()
+                card.addPill(pill(pair, null, false) {
+                    card.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                    fillMenu(card, 1)
+                    repositionMenu(card)
+                })
+
+                val bottom = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                    layoutDirection = View.LAYOUT_DIRECTION_LTR
                 }
+                val sz = dp(48)
+                bottom.addView(roundButton("⏻") { stopSelf() },
+                    LinearLayout.LayoutParams(sz, sz).apply { marginEnd = dp(14) })
+                bottom.addView(roundButton("↩") { closeMenu() }, LinearLayout.LayoutParams(sz, sz))
+                card.addView(bottom, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(12) })
             }
-        }
-    }
-
-    private fun markDirty(now: Long) {
-        if (!dirty) dirtySince = now
-        dirty = true
-        stableSince = now
-    }
-
-    /** يمسح كل الصناديق فوراً ويلغي أي ترجمة شغالة (نتيجتها صارت قديمة). */
-    private fun dropAll() {
-        epoch++
-        layer?.clearItems()
-        clean = null
-        boxHistory.clear()
-    }
-
-    private fun pushHistory(boxes: List<Rect>) {
-        boxHistory.addLast(boxes)
-        while (boxHistory.size > 2) boxHistory.removeFirst()
-    }
-
-    private suspend fun tick() {
-        ensureSize()
-        val lyr = layer ?: return
-        val now = SystemClock.uptimeMillis()
-        val isNew = pullFrame()
-        val img = held ?: return
-
-        if (!isNew) {            // الشاشة ثابتة
-            maybeRefresh(now)
-            return
-        }
-
-        val area = areaRect()
-        val cur = Scroll.makeSig(img, area)
-        val prev = prevSig
-        prevSig = cur
-        if (prev == null) {
-            markDirty(now)
-            return
-        }
-
-        val boxes = lyr.boxes()
-        val rects = ArrayList<Rect>(boxes)
-        for (h in boxHistory) rects.addAll(h)
-        rects.addAll(excludeRects())
-        val mask = Scroll.makeMask(cur, rects)
-        val c = Scroll.compare(prev, cur, mask, boxes.isNotEmpty())
-
-        when (c.kind) {
-            Cmp.SHIFT -> {
-                lyr.shiftY(c.dy, areaRect())
-                totalShift += c.dy
-                markDirty(now)
-            }
-            Cmp.CHANGED -> {
-                dropAll()
-                markDirty(now)
-            }
-            Cmp.UNRELIABLE -> {
-                if (!busy && boxes.isNotEmpty() && now - lastPeek > 1200) {
-                    lastPeek = now
-                    busy = true
-                    scope.launch { peek() }
+            1, 2 -> {
+                val list = if (page == 1) Langs.sources else Langs.targets
+                card.addView(TextView(this).apply {
+                    text = if (page == 1) "لغة النص الأصلي" else "ترجم إلى"
+                    textSize = 15f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(0xFF1B1B1F.toInt())
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
+                val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                for (l in list) {
+                    val cur = if (page == 1) settings.src else settings.tgt
+                    box.addPill(pill(l.name, null, l.code == cur) {
+                        if (page == 1) {
+                            fillMenu(card, 2, pickedSrc = l.code)
+                            repositionMenu(card)
+                        } else {
+                            val s = pickedSrc ?: settings.src
+                            closeMenu()
+                            applyLanguages(s, l.code)
+                        }
+                    }, 44)
                 }
+                val sv = ScrollView(this).apply { addView(box) }
+                card.addView(sv, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, minOf(dp(340), screenH / 2)
+                ))
+                card.addPill(pill("رجوع", "↩", false) {
+                    fillMenu(card, 0)
+                    repositionMenu(card)
+                }, 44)
             }
-            else -> {}
-        }
-        pushHistory(boxes)
-        maybeRefresh(now)
-    }
-
-    private fun maybeRefresh(now: Long) {
-        if (busy || !dirty) return
-        if (now - stableSince < settings.settleMs && now - dirtySince < 1500) return
-        val img = held ?: return
-        val lyr = layer ?: return
-
-        val boxes = lyr.boxes()
-        val cl = clean
-        if (boxes.isNotEmpty() && cl == null) {
-            // عندنا صناديق بس بدون صورة نظيفة نرجع منها الأصل → نتأكد بلقطة نظيفة
-            busy = true
-            scope.launch { peek() }
-            return
-        }
-        busy = true
-        dirty = false
-        val myEpoch = epoch
-        val snap = totalShift
-        val bmp = imageToBitmap(img)
-        if (boxes.isEmpty()) {
-            cleanSig = Scroll.makeSig(img, areaRect())
-        } else if (cl != null) {
-            compose(bmp, boxes, cl, totalShift - cleanShift)
-        }
-        scope.launch { doRefresh(bmp, myEpoch, snap) }
-    }
-
-    /** يرجّع الأصل تحت صناديقنا من آخر صورة نظيفة (مزاحة بمقدار التمرير) فتصير اللقطة "نظيفة". */
-    private fun compose(frameBmp: Bitmap, boxes: List<Rect>, cl: Bitmap, delta: Int) {
-        val canvas = Canvas(frameBmp)
-        val bounds = Rect(0, 0, cl.width, cl.height)
-        for (r in boxes) {
-            val dst = Rect(r)
-            if (!dst.intersect(0, 0, frameBmp.width, frameBmp.height)) continue
-            val src = Rect(dst.left, dst.top - delta, dst.right, dst.bottom - delta)
-            if (!src.intersect(bounds)) continue
-            val ndst = Rect(src.left, src.top + delta, src.right, src.bottom + delta)
-            canvas.drawBitmap(cl, src, ndst, null)
         }
     }
 
-    private suspend fun doRefresh(bmp: Bitmap, myEpoch: Int, snap: Int) {
-        try {
-            val crop = if (settings.mode == 1) areaRect() else null
-            val blocks = engine.detect(bmp, settings.src, crop, excludeRects())
-            if (myEpoch != epoch) return
-            val lyr = layer ?: return
-            if (blocks.isEmpty()) {
-                lyr.clearItems()
-                clean = bmp
-                cleanShift = snap
-                return
-            }
-            val tr = hub.translate(blocks.map { it.text })
-            if (myEpoch != epoch) return
-
-            val items = ArrayList<Item>()
-            for ((i, b) in blocks.withIndex()) {
-                val t = tr[i] ?: continue
-                if (t.isBlank() || sameText(t, b.text)) continue
-                items.add(Item(b.rect, t, b.bg, b.fg, b.lines))
-            }
-            lyr.setItems(items, areaRect(), totalShift - snap)
-            clean = bmp
-            cleanShift = snap
-            pushHistory(lyr.boxes())
-            if (totalShift != snap) markDirty(SystemClock.uptimeMillis())
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            toast("خطأ بالترجمة: ${e.message ?: e.javaClass.simpleName}")
-        } finally {
-            busy = false
-        }
+    private fun chooseMode(m: Mode) {
+        closeMenu()
+        applyMode(m, fromMenu = true)
     }
 
-    private fun sameText(a: String, b: String): Boolean =
-        a.filter { !it.isWhitespace() }.equals(b.filter { !it.isWhitespace() }, ignoreCase = true)
+    private fun repositionMenu(card: LinearLayout) {
+        val lp = card.layoutParams as? FrameLayout.LayoutParams ?: return
+        card.measure(
+            View.MeasureSpec.makeMeasureSpec(dp(236), View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val h = card.measuredHeight
+        val bl = bubbleLp ?: return
+        lp.topMargin = (bl.y - dp(40)).coerceIn(dp(24), maxOf(dp(24), screenH - h - dp(24)))
+        scrim?.updateViewLayout(card, lp)
+    }
 
-    /** لقطة نظيفة سريعة (نخفي الطبقة ~فريمين) للأوضاع اللي ما نقدر نتتبع فيها بدون رؤية. */
-    private suspend fun peek() {
-        val lyr = layer
-        if (lyr == null) {
-            busy = false
-            return
+    private fun openMenu() {
+        if (scrim != null) return
+        val pl = pipeline ?: return
+        pl.setSuspended(true)
+
+        val sc = FrameLayout(this).apply {
+            setBackgroundColor(0x33000000)
+            setOnClickListener { closeMenu() }
         }
-        var handed = false
-        try {
-            val c0 = frameCounter
-            lyr.alpha = 0f
-            var waited = 0
-            while (frameCounter < c0 + 2 && waited < 260) {
-                delay(16)
-                waited += 16
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(12), dp(8), dp(12), dp(14))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(30).toFloat()
+                setColor(Color.WHITE)
             }
-            pullFrame()
-            val img = held ?: return
-            val sig = Scroll.makeSig(img, areaRect())
-            val ref = cleanSig
-            if (ref != null && lyr.isEmpty().not()) {
-                val cmp = Scroll.compare(ref, sig, Scroll.emptyMask(sig), false)
-                if (cmp.kind == Cmp.STATIC) return        // ما تغيّر شي → نرجّع الطبقة
-            }
-            val bmp = imageToBitmap(img)
-            dropAll()
-            cleanSig = sig
-            lyr.alpha = 1f
-            handed = true
-            dirty = false
-            doRefresh(bmp, epoch, totalShift)
-        } finally {
-            lyr.alpha = 1f
-            if (!handed) busy = false
+            elevation = dp(12).toFloat()
+            isClickable = true
         }
+        fillMenu(card, 0)
+
+        val bl = bubbleLp!!
+        val cardW = dp(236)
+        val lp = FrameLayout.LayoutParams(cardW, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.leftMargin = if (bl.x + bubbleSize / 2 < screenW / 2) bl.x + bubbleSize + dp(8)
+        else maxOf(dp(8), bl.x - cardW - dp(8))
+        lp.topMargin = dp(24)
+        sc.addView(card, lp)
+
+        val wlp = WindowManager.LayoutParams(
+            screenW, screenH, overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        wm.addView(sc, wlp)
+        scrim = sc
+        repositionMenu(card)
+    }
+
+    private fun closeMenu() {
+        val sc = scrim ?: return
+        runCatching { wm.removeView(sc) }
+        scrim = null
+        main.postDelayed({ pipeline?.setSuspended(false) }, 300)
+    }
+
+    // ================================================================= تدوير الشاشة
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        main.removeCallbacks(resizeRunnable)
+        main.postDelayed(resizeRunnable, 400)
+    }
+
+    private val resizeRunnable = Runnable {
+        val src = source ?: return@Runnable
+        val dm = realMetrics()
+        if (dm.widthPixels == screenW && dm.heightPixels == screenH) return@Runnable
+        screenW = dm.widthPixels
+        screenH = dm.heightPixels
+        closeMenu()
+        regionView?.let { v -> runCatching { wm.removeView(v) } }
+        regionView = null
+        runCatching { src.resize(screenW, screenH, dm.densityDpi) }
+        layerLp?.let {
+            it.width = screenW
+            it.height = screenH
+            layer?.let { v -> runCatching { wm.updateViewLayout(v, it) } }
+        }
+        bubbleLp?.let {
+            it.x = it.x.coerceIn(0, screenW - bubbleSize)
+            it.y = it.y.coerceIn(0, screenH - bubbleSize)
+            bubble?.let { v -> runCatching { wm.updateViewLayout(v, it) } }
+        }
+        pipeline?.onResize(screenW, screenH)
     }
 
     // ================================================================= notification
@@ -837,7 +644,7 @@ class OverlayService : Service() {
         val notif = builder
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("بيور ترجمة شغال")
-            .setContentText("اضغط هنا لفتح التطبيق")
+            .setContentText("ضغطة مطولة على الفقاعة لتغيير الطور")
             .setContentIntent(openIntent)
             .addAction(Notification.Action.Builder(stopIcon, "إيقاف", stopIntent).build())
             .setOngoing(true)
@@ -850,32 +657,26 @@ class OverlayService : Service() {
         }
     }
 
-    private fun toast(msg: String) {
-        main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() }
-    }
+    // ================================================================= destroy
 
     override fun onDestroy() {
         running = false
-        loopJob?.cancel()
-        scope.cancel()
         main.removeCallbacksAndMessages(null)
-        runCatching { menu?.let { wm.removeView(it) } }
-        runCatching { handle?.let { wm.removeView(it) } }
+        pipeline?.stop()
+        scope.cancel()
+        scrim?.let { runCatching { wm.removeView(it) } }
+        regionView?.let { runCatching { wm.removeView(it) } }
         runCatching { bubble?.let { wm.removeView(it) } }
         runCatching { layer?.let { wm.removeView(it) } }
-        menu = null
-        handle = null
+        scrim = null
+        regionView = null
         bubble = null
         layer = null
-        runCatching { held?.close() }
-        held = null
-        runCatching { vd?.release() }
-        runCatching { reader?.close() }
+        source?.release()
         projectionCallback?.let { cb -> runCatching { projection?.unregisterCallback(cb) } }
         runCatching { projection?.stop() }
-        if (::engine.isInitialized) engine.close()
-        if (::hub.isInitialized) hub.close()
-        clean = null
+        translators?.close()
+        ocr?.close()
         super.onDestroy()
     }
 }
