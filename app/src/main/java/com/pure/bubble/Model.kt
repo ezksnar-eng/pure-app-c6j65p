@@ -97,24 +97,30 @@ data class AppSettings(
 )
 
 object Prefs {
-    private const val FILE = "pure_bubble2"
+    private const val FILE = "pure_bubble3"
+
+    private fun str(p: android.content.SharedPreferences, k: String, def: String): String =
+        (p.all[k] as? String) ?: def
+
+    private fun int(p: android.content.SharedPreferences, k: String, def: Int): Int =
+        (p.all[k] as? Int) ?: def
 
     fun load(c: Context): AppSettings {
         val p = c.getSharedPreferences(FILE, Context.MODE_PRIVATE)
         val d = AppSettings()
         return AppSettings(
-            src = p.getString("src", d.src) ?: d.src,
-            tgt = p.getString("tgt", d.tgt) ?: d.tgt,
-            mode = Mode.of(p.getString("mode", d.mode.key)),
-            engine = p.getString("engine", d.engine) ?: d.engine,
-            geminiKey = p.getString("gkey", "") ?: "",
-            geminiModel = p.getString("gmodel", d.geminiModel) ?: d.geminiModel,
-            oaiBase = p.getString("obase", d.oaiBase) ?: d.oaiBase,
-            oaiKey = p.getString("okey", "") ?: "",
-            oaiModel = p.getString("omodel", d.oaiModel) ?: d.oaiModel,
-            glossary = p.getString("glossary", "") ?: "",
-            coverAlpha = p.getInt("cover", d.coverAlpha),
-            bubbleAlpha = p.getInt("bubble", d.bubbleAlpha)
+            src = str(p, "src", d.src),
+            tgt = str(p, "tgt", d.tgt),
+            mode = Mode.of(str(p, "mode", d.mode.key)),
+            engine = str(p, "engine", d.engine),
+            geminiKey = str(p, "gkey", ""),
+            geminiModel = str(p, "gmodel", d.geminiModel),
+            oaiBase = str(p, "obase", d.oaiBase),
+            oaiKey = str(p, "okey", ""),
+            oaiModel = str(p, "omodel", d.oaiModel),
+            glossary = str(p, "glossary", ""),
+            coverAlpha = int(p, "cover", d.coverAlpha),
+            bubbleAlpha = int(p, "bubble", d.bubbleAlpha)
         )
     }
 

@@ -146,6 +146,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            buildUi()
+        } catch (e: Throwable) {
+            showError("خطأ بالواجهة", e.stackTraceToString())
+        }
+    }
+
+    /** يعرض نص الخطأ على الشاشة (قابل للتحديد) بدل ما يسكّر التطبيق. */
+    private fun showError(title: String, body: String) {
+        val tv = TextView(this).apply {
+            text = "$title\n\n$body"
+            textSize = 12f
+            setTextColor(Color.BLACK)
+            setTextIsSelectable(true)
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setPadding(dp(16), dp(32), dp(16), dp(32))
+        }
+        setContentView(ScrollView(this).apply { addView(tv) })
+    }
+
+    private fun buildUi() {
         window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
         window.statusBarColor = Color.WHITE
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
@@ -256,6 +277,21 @@ class MainActivity : ComponentActivity() {
             ), 20
         )
 
+        val crash = java.io.File(filesDir, App.CRASH_FILE)
+        if (crash.exists()) {
+            val txt = runCatching { crash.readText() }.getOrDefault("")
+            crash.delete()
+            if (txt.isNotBlank()) {
+                root.addWithTop(label("آخر انهيار سُجّل (صوّره وابعثه):", 14f, true, 0xFFB3261E.toInt()), 20)
+                root.addView(TextView(this).apply {
+                    text = txt.take(3000)
+                    textSize = 10f
+                    setTextIsSelectable(true)
+                    layoutDirection = View.LAYOUT_DIRECTION_LTR
+                })
+            }
+        }
+
         setContentView(ScrollView(this).apply { addView(root) })
         refreshButton()
     }
@@ -272,6 +308,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshButton() {
+        if (!::startBtn.isInitialized) return
         val running = OverlayService.running
         startBtn.text = if (running) "إيقاف" else "بدء"
         startBtn.background = roundBg(if (running) 0xFFB3261E.toInt() else blue, 40)
